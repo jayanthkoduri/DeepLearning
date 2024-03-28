@@ -1,394 +1,264 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[1]:
-
-
 import os
 import json
 import torch
-from torch import nn
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ExponentialLR
 import transformers
-from transformers import BertModel, BertTokenizerFast
+from transformers import BertModel, BertTokenizerFast, AdamW
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import requests
 
+device_setting = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-# In[2]:
+def read_dataset(json_file_path):
 
+    doc_texts = []
+    query_texts = []
+    solution_texts = []
 
-device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-#print(device)
+    total_queries = 0
+    total_with_answers = 0
+    total_without_answers = 0
 
+    with open(json_file_path, 'r') as file_handle:
+        dataset_json = json.load(file_handle)
 
-# In[3]:
+    for item in dataset_json['data']:
+        for passage in item['paragraphs']:
+            passage_text = passage['context'].lower()
+            for q_and_a in passage['qas']:
+                total_queries += 1
+                query_text = q_and_a['question'].lower()
+                for solution in q_and_a['answers']:
+                    doc_texts.append(passage_text)
+                    query_texts.append(query_text)
+                    solution_texts.append(solution)
 
+    return total_queries, total_with_answers, total_without_answers, doc_texts, query_texts, solution_texts
 
-def load_dataset(file_path):
-    """
-    Load and preprocess dataset from a JSON file.
+total_queries_train, with_answers_train, without_answers_train, docs_train, queries_train, solutions_train = read_dataset('data/spoken_train-v1.1.json')
+query_count_train = total_queries_train
 
-    Parameters:
-    - file_path: Path to the JSON file containing the dataset.
+total_queries_valid, with_answers_valid, without_answers_valid, docs_valid, queries_valid, solutions_valid = read_dataset('data/spoken_test-v1.1.json')
+query_count_valid = total_queries_valid
 
-    Returns:
-    - num_questions: Total number of questions.
-    - num_positive: Total number of positive answers (Not used in this function, but placeholder for extension).
-    - num_impossible: Total number of impossible questions (Not used in this function, but placeholder for extension).
-    - contexts: List of context passages.
-    - questions: List of questions.
-    - answers: List of answer dictionaries.
-    """
-    contexts = []
-    questions = []
-    answers = []
+def add_solution_end(solutions, docs):
+    for solution, _ in zip(solutions, docs):
+        solution['text'] = solution['text'].lower()
+        solution['solution_end'] = solution['answer_start'] + len(solution['text'])
+add_solution_end(solutions_train, docs_train)
+add_solution_end(solutions_valid, docs_valid)
 
-    num_questions = 0
-    num_positive = 0  # positive answers count
-    num_impossible = 0  # impossible questions count
+MAX_SEQ_LENGTH = 512
+PRETRAINED_MODEL = "deepset/bert-base-cased-squad2"
 
-    with open(file_path, 'r') as file:
-        data = json.load(file)
+stride_len = 128
+tokenizer = BertTokenizerFast.from_pretrained(PRETRAINED_MODEL)
 
-    for article in data['data']:
-        for paragraph in article['paragraphs']:
-            context = paragraph['context'].lower()
-            for qa in paragraph['qas']:
-                num_questions += 1
-                question = qa['question'].lower()
-                for answer in qa['answers']:
-                    contexts.append(context)
-                    questions.append(question)
-                    answers.append(answer)
+training_encodings = tokenizer(docs_train, queries_train, max_length=MAX_SEQ_LENGTH, truncation=True, stride=stride_len, padding=True)
+validation_encodings = tokenizer(queries_valid, docs_valid, max_length=MAX_SEQ_LENGTH, truncation=True, stride=stride_len, padding=True)
 
-    return num_questions, num_positive, num_impossible, contexts, questions, answers
-
-
-# In[4]:
-
-
-# Load and preprocess the training dataset
-num_q, num_pos, num_imp, train_contexts, train_questions, train_answers = load_dataset('data/spoken_train-v1.1.json')
-num_questions_train = num_q
-num_possible_train = num_pos
-num_impossible_train = num_imp
-
-# Load and preprocess the validation dataset
-num_q, num_pos, num_imp, valid_contexts, valid_questions, valid_answers = load_dataset('data/spoken_test-v1.1.json')
-num_questions_valid = num_q
-num_possible_valid = num_pos
-num_impossible_valid = num_imp
-
-
-# In[5]:
-
-
-def append_answer_end_to_answers(answers, contexts):
-    """
-    Enhance the answers dictionary by appending the 'answer_end' key.
-
-    Parameters:
-    - answers: A list of dictionaries, where each dictionary represents an answer and contains at least 'text' and 'answer_start' keys.
-    - contexts: A list of context strings corresponding to each answer in the answers list.
-
-    Returns:
-    None; the function modifies the answers list in place.
-    """
-    for answer, _ in zip(answers, contexts):
-        answer['text'] = answer['text'].lower()
-        answer['answer_end'] = answer['answer_start'] + len(answer['text'])
-
-#training and validation datasets
-append_answer_end_to_answers(train_answers, train_contexts)
-append_answer_end_to_answers(valid_answers, valid_contexts)
-
-
-# In[6]:
-
-
-MAX_LENGTH = 512
-MODEL_PATH = "bert-base-uncased"
-
-doc_stride = 128
-tokenizerFast = BertTokenizerFast.from_pretrained(MODEL_PATH)
-pad_on_right = tokenizerFast.padding_side == "right"
-train_contexts_trunc=[]
-
-
-# In[7]:
-
-
-# train_encodings = tokenizerFast(train_questions, train_contexts,  max_length = MAX_LENGTH,truncation=True,padding=True)
-# valid_encodings = tokenizerFast(valid_questions,valid_contexts,  max_length = MAX_LENGTH, truncation=True,padding=True)
-
-
-# In[8]:
-
-
-def truncate_and_tokenize_contexts(contexts, answers, questions, tokenizer, max_length, doc_stride):
-    truncated_contexts = []
-    for i, context in enumerate(contexts):
-        if len(context) > max_length:
-            answer_start = answers[i]['answer_start']
-            answer_end = answer_start + len(answers[i]['text'])
-            mid_point = (answer_start + answer_end) // 2
-            start_point = max(0, min(mid_point - max_length // 2, len(context) - max_length))
-            end_point = start_point + max_length
-            start_point = int(start_point)
-            end_point = int(end_point)
-            truncated_context = context[start_point:end_point]
-            truncated_contexts.append(truncated_context)
-            answers[i]['answer_start'] = answer_start - start_point
-        else:
-            truncated_contexts.append(context)
-
-    encodings = tokenizer(
-        questions,
-        truncated_contexts,
-        max_length=max_length,
-        truncation=True,
-        stride=doc_stride,
-        padding='max_length',
-        return_tensors='pt'
-    )
-    return encodings
-
-train_encodings_fast = truncate_and_tokenize_contexts(train_contexts, train_answers, train_questions, tokenizerFast, MAX_LENGTH, doc_stride)
-valid_encodings_fast = tokenizerFast(valid_questions, valid_contexts, max_length=MAX_LENGTH, truncation=True, stride=doc_stride, padding='max_length', return_tensors='pt')
-
-
-# In[9]:
-
-
-def ret_Answer_start_and_end_train(idx):
-    ret_start = 0
-    ret_end = 0
-    answer_encoding_fast = tokenizerFast(train_answers[idx]['text'],  max_length = MAX_LENGTH, truncation=True, padding=True)
-    for a in range( len(train_encodings_fast['input_ids'][idx]) -  len(answer_encoding_fast['input_ids']) ):
-        match = True
-        for i in range(1,len(answer_encoding_fast['input_ids']) - 1):
-            if (answer_encoding_fast['input_ids'][i] != train_encodings_fast['input_ids'][idx][a + i]):
-                match = False
+def locate_solution_positions_train(index):
+    start_position = 0
+    end_position = 0
+    solution_encoding = tokenizer(solutions_train[index]['text'],  max_length = MAX_SEQ_LENGTH, truncation=True, padding=True)
+    for offset in range( len(training_encodings['input_ids'][index]) -  len(solution_encoding['input_ids']) ):
+        sequence_match = True
+        for inner_idx in range(1,len(solution_encoding['input_ids']) - 1):
+            if (solution_encoding['input_ids'][inner_idx] != training_encodings['input_ids'][index][offset + inner_idx]):
+                sequence_match = False
                 break
-            if match:
-                ret_start = a+1
-                ret_end = a+i+1
+            if sequence_match:
+                start_position = offset+1
+                end_position = offset+inner_idx+1
                 break
-    return(ret_start, ret_end)
+    return(start_position, end_position)
 
-start_positions = []
-end_positions = []
-ctr = 0
-for h in range(len(train_encodings_fast['input_ids'])):
-    s, e = ret_Answer_start_and_end_train(h)
-    start_positions.append(s)
-    end_positions.append(e)
-    if s==0:
-        ctr = ctr + 1
-    
-train_encodings_fast.update({'start_positions': start_positions, 'end_positions': end_positions})
-valid_encodings_fast.update({'start_positions': start_positions, 'end_positions': end_positions})
+start_locs = []
+end_locs = []
+mismatch_counter = 0
+for idx in range(len(training_encodings['input_ids'])):
+    loc_start, loc_end = locate_solution_positions_train(idx)
+    start_locs.append(loc_start)
+    end_locs.append(loc_end)
+    if loc_start==0:
+        mismatch_counter += 1
+training_encodings.update({'start_positions': start_locs, 'end_positions': end_locs})
 
+def locate_solution_positions_valid(index):
+    start_position = 0
+    end_position = 0
+    solution_encoding = tokenizer(solutions_valid [index]['text'],  max_length = MAX_SEQ_LENGTH, truncation=True, padding=True)
+    for offset in range( len(validation_encodings['input_ids'][index]) -  len(solution_encoding['input_ids']) ):
+        sequence_match = True
+        for inner_idx in range(1,len(solution_encoding['input_ids']) - 1):
+            if (solution_encoding['input_ids'][inner_idx] != validation_encodings['input_ids'][index][offset + inner_idx]):
+                sequence_match = False
+                break
+            if sequence_match:
+                start_position = offset+1
+                end_position = offset+inner_idx+1
+                break
+    return(start_position, end_position)
 
-# In[11]:
+start_locs = []
+end_locs = []
+mismatch_counter = 0
+for idx in range(len(validation_encodings['input_ids'])):
+    loc_start, loc_end = locate_solution_positions_valid(idx)
+    start_locs.append(loc_start)
+    end_locs.append(loc_end)
+    if loc_start==0:
+        mismatch_counter += 1
 
+validation_encodings.update({'start_positions': start_locs, 'end_positions': end_locs})
 
-class InputDataset(Dataset):
-    def __init__(self, encodings):
-        self.encodings = {k: torch.tensor(v) for k, v in encodings.items()}
+class EncodedDataset(Dataset):
+    def __init__(self, encoded_pairs):
+        self.encoded_pairs = {key: torch.tensor(value) for key, value in encoded_pairs.items()}
     
     def __getitem__(self, idx):
-        return {key: val[idx] for key, val in self.encodings.items()}
+        return {key: val[idx] for key, val in self.encoded_pairs.items()}
     
     def __len__(self):
-        return len(self.encodings['input_ids'])
-train_dataset = InputDataset(train_encodings_fast)
-valid_dataset = InputDataset(valid_encodings_fast)
+        return len(self.encoded_pairs['input_ids'])
+training_dataset = EncodedDataset(training_encodings)
+validation_dataset = EncodedDataset(validation_encodings)
 
-train_data_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-valid_data_loader = DataLoader(valid_dataset, batch_size=16)
+training_loader = DataLoader(training_dataset, batch_size=16, shuffle=True)
+validation_loader = DataLoader(validation_dataset, batch_size=16)
 
-
-# In[12]:
-
-
-bert_model = BertModel.from_pretrained(MODEL_PATH)
-
-
-# In[13]:
-
+transformer_model = BertModel.from_pretrained(PRETRAINED_MODEL)
 
 import torch
-import torch.nn as nn
-from transformers import BertModel
-
-class QAModel(nn.Module):
-    def __init__(self, bert_model_name='bert-base-uncased'):
+import torch.nn.functional as F 
+class TransformerQAModel(nn.Module):
+    def __init__(self, transformer_model_name='deepset/bert-base-cased-squad2'):
         super().__init__()
-        self.bert = BertModel.from_pretrained(bert_model_name)
-        self.dropout = nn.Dropout(0.1)
-        self.fc1 = nn.Linear(768 * 2, 768 * 2)
-        self.fc2 = nn.Linear(768 * 2, 2)
-        self.relu = nn.LeakyReLU()
+        self.transformer = BertModel.from_pretrained(transformer_model_name)
+        self.drop_layer = nn.Dropout(0.1)
+        self.linear_layer1 = nn.Linear(768 * 2, 768 * 2)
+        self.output_layer = nn.Linear(768 * 2, 2)
+        self.activation_func = nn.LeakyReLU()
 
-    def forward(self, input_ids, attention_mask, token_type_ids):
-        outputs = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, return_dict=True, output_hidden_states=True)
-        concatenated_hidden_states = torch.cat((outputs.hidden_states[-1], outputs.hidden_states[-3]), dim=-1)
-        x = self.dropout(concatenated_hidden_states)
-        x = self.relu(self.fc1(x))
-        logits = self.fc2(x)
+    def forward(self, input_id_stream, attention_mask_stream, token_type_id_stream):
+        model_outputs = self.transformer(input_id_stream, attention_mask=attention_mask_stream, token_type_ids=token_type_id_stream, return_dict=True, output_hidden_states=True)
+        concat_hidden_states = torch.cat((model_outputs.hidden_states[-1], model_outputs.hidden_states[-3]), dim=-1)
+        x = self.drop_layer(concat_hidden_states)
+        x = self.activation_func(self.linear_layer1(x))
+        logits = self.output_layer(x)
         start_logits, end_logits = logits.split(1, dim=-1)
         start_logits = start_logits.squeeze(-1)
         end_logits = end_logits.squeeze(-1)
 
         return start_logits, end_logits
 
-model = QAModel(bert_model_name='bert-base-uncased')
+transformer_qa_model = TransformerQAModel(transformer_model_name='deepset/bert-base-cased-squad2')
 
-
-# In[14]:
-
-
-import torch.nn.functional as F
-def compute_focal_loss(start_logits, end_logits, start_positions, end_positions, gamma=2.0):
-    """
-    Computes the focal loss for both start and end positions of answers in a question-answering model.
-
-    Parameters:
-    - start_logits (torch.Tensor): Logits for start positions, shape [batch_size, seq_length].
-    - end_logits (torch.Tensor): Logits for end positions, shape [batch_size, seq_length].
-    - start_positions (torch.Tensor): True start positions, shape [batch_size].
-    - end_positions (torch.Tensor): True end positions, shape [batch_size].
-    - gamma (float): Focusing parameter for focal loss to reduce the loss contribution from easy examples and put more focus on hard, misclassified examples.
-
-    Returns:
-    - torch.Tensor: The average focal loss for start and end logits.
-    """
-    ce_loss = torch.nn.CrossEntropyLoss(reduction='none')
-    start_loss = ce_loss(start_logits, start_positions)
-    end_loss = ce_loss(end_logits, end_positions)
+def calculate_focal_loss(start_logit_stream, end_logit_stream, start_pos_stream, end_pos_stream, focal_gamma=2.0):
+    ce_loss_func = torch.nn.CrossEntropyLoss(reduction='none')
+    start_loss_vals = ce_loss_func(start_logit_stream, start_pos_stream)
+    end_loss_vals = ce_loss_func(end_logit_stream, end_pos_stream)
     
-    start_probs = F.softmax(start_logits, dim=1).gather(1, start_positions.unsqueeze(1)).squeeze(1)
-    end_probs = F.softmax(end_logits, dim=1).gather(1, end_positions.unsqueeze(1)).squeeze(1)
+    start_probs = F.softmax(start_logit_stream, dim=1).gather(1, start_pos_stream.unsqueeze(1)).squeeze(1)
+    end_probs = F.softmax(end_logit_stream, dim=1).gather(1, end_pos_stream.unsqueeze(1)).squeeze(1)
     
-    start_focal_loss = ((1 - start_probs) ** gamma) * start_loss
-    end_focal_loss = ((1 - end_probs) ** gamma) * end_loss
+    focal_loss_start = ((1 - start_probs) ** focal_gamma) * start_loss_vals
+    focal_loss_end = ((1 - end_probs) ** focal_gamma) * end_loss_vals
     
-    focal_loss = (start_focal_loss + end_focal_loss) / 2.0
+    focal_loss_total = (focal_loss_start + focal_loss_end) / 2.0
     
-    return focal_loss.mean()
+    return focal_loss_total.mean()
 
-
-# In[15]:
-
-
-optim = AdamW(model.parameters(), lr=2e-5, weight_decay=2e-2)
-total_acc = []
-total_loss = []
-
-
-# In[16]:
-
+optimizer = AdamW(transformer_qa_model.parameters(), lr=2e-5, weight_decay=2e-2)
+scheduler = ExponentialLR(optimizer, gamma=0.9)
 
 from tqdm import tqdm
 import torch
-
-def train_epoch(model, dataloader, epoch):
+def train_model_epoch(model, loader, current_epoch):
     model.train()
-    total_losses = []
-    total_acc = []
-    batch_tracker = 0
+    epoch_losses = []
+    epoch_accuracy = []
+    progress_indicator = 0
 
-    for batch in tqdm(dataloader, desc='Running Epoch ' + str(epoch) + ':'):
-        optim.zero_grad()
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        token_type_ids = batch['token_type_ids'].to(device)
-        start_positions = batch['start_positions'].to(device)
-        end_positions = batch['end_positions'].to(device)
+    for batch_data in tqdm(loader, desc='Epoch ' + str(current_epoch) + ' Progress:'):
+        optimizer.zero_grad()
+        input_ids_batch = batch_data['input_ids'].to(device_setting)
+        attention_masks_batch = batch_data['attention_mask'].to(device_setting)
+        token_type_ids_batch = batch_data['token_type_ids'].to(device_setting)
+        start_pos_batch = batch_data['start_positions'].to(device_setting)
+        end_pos_batch = batch_data['end_positions'].to(device_setting)
         
-        out_start, out_end = model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        start_predictions, end_predictions = model(input_id_stream=input_ids_batch, attention_mask_stream=attention_masks_batch, token_type_id_stream=token_type_ids_batch)
 
-        loss = compute_focal_loss(out_start, out_end, start_positions, end_positions, 1)  # Gamma=1
-        total_losses.append(loss.item())
+        loss = calculate_focal_loss(start_predictions, end_predictions, start_pos_batch, end_pos_batch, 1)  # Using gamma=1 for focal loss
+        epoch_losses.append(loss.item())
         
         loss.backward()
-        optim.step()
+        optimizer.step()
         
-        start_pred = torch.argmax(out_start, dim=1)
-        end_pred = torch.argmax(out_end, dim=1)
-        acc = ((start_pred == start_positions).float().mean() + (end_pred == end_positions).float().mean()) / 2.0
-        total_acc.append(acc.item())
+        start_pred_class = torch.argmax(start_predictions, dim=1)
+        end_pred_class = torch.argmax(end_predictions, dim=1)
+        accuracy = ((start_pred_class == start_pos_batch).float().mean() + (end_pred_class == end_pos_batch).float().mean()) / 2.0
+        epoch_accuracy.append(accuracy.item())
 
-        if batch_tracker == 250 and epoch == 1:
-            print(f'Intermediate Loss after 250 batches in epoch 1: {sum(total_losses)/len(total_losses)}')
-            print(f'Intermediate Accuracy after 250 batches in epoch 1: {sum(total_acc)/len(total_acc)}')
-            batch_tracker = 0
+        if progress_indicator == 250 and current_epoch == 1:
+            print(f'Intermediate Loss after 250 batches in epoch 1: {sum(epoch_losses)/len(epoch_losses)}')
+            print(f'Intermediate Accuracy after 250 batches in epoch 1: {sum(epoch_accuracy)/len(epoch_accuracy)}')
+            progress_indicator = 0
         
-        batch_tracker += 1
+        progress_indicator += 1
 
-    avg_loss = sum(total_losses) / len(total_losses)
-    avg_acc = sum(total_acc) / len(total_acc)
+    scheduler.step()
+    epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
+    epoch_avg_acc = sum(epoch_accuracy) / len(epoch_accuracy)
 
-    return avg_acc, avg_loss
+    return epoch_avg_acc, epoch_avg_loss
 
-
-# In[17]:
-
-
-def eval_model(model, dataloader):
+def evaluate_model(model, loader):
     model.eval()
-    answer_list = []
+    prediction_comparison = []
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc='Running Evaluation'):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            token_type_ids = batch['token_type_ids'].to(device)
-            start_positions = batch['start_positions'].to(device)
-            end_positions = batch['end_positions'].to(device)
+        for batch in tqdm(loader, desc='Evaluation in Progress'):
+            input_ids_eval = batch['input_ids'].to(device_setting)
+            attention_mask_eval = batch['attention_mask'].to(device_setting)
+            token_type_ids_eval = batch['token_type_ids'].to(device_setting)
 
-            out_start, out_end = model(input_ids=input_ids,
-                                       attention_mask=attention_mask,
-                                       token_type_ids=token_type_ids)
+            start_logits_eval, end_logits_eval = model(input_id_stream=input_ids_eval, attention_mask_stream=attention_mask_eval, token_type_id_stream=token_type_ids_eval)
 
-            for i in range(input_ids.shape[0]):
-                start_pred = torch.argmax(out_start[i]).item()
-                end_pred = torch.argmax(out_end[i]).item() + 1 
-                pred_answer = tokenizerFast.decode(input_ids[i][start_pred:end_pred], skip_special_tokens=True, clean_up_tokenization_spaces=True)
-                true_answer = tokenizerFast.decode(input_ids[i][start_positions[i]:end_positions[i]+1], skip_special_tokens=True, clean_up_tokenization_spaces=True)  # +1 to make end position inclusive
+            for idx in range(input_ids_eval.shape[0]):
+                start_pred_idx = torch.argmax(start_logits_eval[idx]).item()
+                end_pred_idx = torch.argmax(end_logits_eval[idx]).item() + 1  # +1 to include the end token
+                predicted_answer = tokenizer.decode(input_ids_eval[idx][start_pred_idx:end_pred_idx], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                actual_answer = tokenizer.decode(input_ids_eval[idx][batch['start_positions'][idx]:batch['end_positions'][idx]+1], skip_special_tokens=True, clean_up_tokenization_spaces=True)
                 
-                answer_list.append((pred_answer, true_answer))
+                prediction_comparison.append((predicted_answer, actual_answer))
 
-    return answer_list
-
-
-# In[19]:
-
+    return prediction_comparison
 
 import evaluate
 from evaluate import load
 
-wer = load("wer")
-EPOCHS = 4
-model.to(device)
-wer_list = []
+wer_metric = load("wer")
+EPOCH_COUNT = 4
+transformer_qa_model.to(device_setting)
+wer_scores_over_epochs = []
 
-for epoch in range(EPOCHS):
-    train_acc, train_loss = train_epoch(model, train_data_loader, epoch+1)
-    print(f'Epoch - {epoch+1}')
-    print(f'Accuracy: {train_acc}')
-    print(f'Loss: {train_loss}')
+for epoch_num in range(EPOCH_COUNT):
+    training_accuracy, training_loss = train_model_epoch(transformer_qa_model, training_loader, epoch_num+1)
+    print(f'Epoch - {epoch_num+1}')
+    print(f'Accuracy: {training_accuracy}')
+    print(f'Loss: {training_loss}')
 
-    answer_list = eval_model(model, valid_data_loader)
+    eval_predictions = evaluate_model(transformer_qa_model, validation_loader)
 
-    pred_answers = [ans[0] if len(ans[0]) > 0 else "$" for ans in answer_list]
-    true_answers = [ans[1] if len(ans[1]) > 0 else "$" for ans in answer_list]
+    predicted_texts = [pair[0] if len(pair[0]) > 0 else "$" for pair in eval_predictions]
+    actual_texts = [pair[1] if len(pair[1]) > 0 else "$" for pair in eval_predictions]
 
-    wer_score = wer.compute(predictions=pred_answers, references=true_answers)
-    wer_list.append(wer_score)
+    wer_score_epoch = wer_metric.compute(predictions=predicted_texts, references=actual_texts)
+    wer_scores_over_epochs.append(wer_score_epoch)
 
-print('Boss: ', wer_list)
+print('WER Boss Model:', wer_scores_over_epochs)
